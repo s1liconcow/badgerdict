@@ -51,6 +51,10 @@ def test_persistent_object_roundtrip(tmp_path, shared_library):
     assert loaded.text == "hello world"
     assert loaded.tags == ["demo", "test"]
 
+    scans = Note.scan()
+    assert len(scans) == 1
+    assert scans[0].text == "hello world"
+
     assert Note.exists("n1")
     assert Note.delete("n1")
     with pytest.raises(KeyError):
@@ -74,3 +78,6 @@ def test_persistent_object_multi_process(tmp_path, shared_library):
 
     result = Counter.load("global")
     assert result.value == 4 * 50
+
+    multiples = Counter.scan(predicate=lambda k: isinstance(k, str))
+    assert multiples and multiples[0].value == result.value

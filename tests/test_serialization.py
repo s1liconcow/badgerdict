@@ -1,3 +1,4 @@
+import pickle
 from datetime import datetime
 
 import pytest
@@ -16,6 +17,14 @@ def test_store_various_types(badger_dict_factory):
         assert store["object"] == payload
         assert store[("tuple", 1)] == {"foo": "bar"}
         assert ("tuple", 1) in store
+
+        scan_results = store.scan()
+        decoded_keys = {
+            pickle.loads(k) if k.startswith(b"\x80") else k.decode()
+            for k, _ in scan_results
+        }
+        assert "raw-bytes" in decoded_keys
+        assert "text" in decoded_keys
 
 
 def test_auto_pickle_disabled(shared_library, tmp_path):

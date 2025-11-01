@@ -10,6 +10,8 @@ This project exposes a minimal dictionary-shaped interface to [BadgerDB](https:/
   inheritable ORM-style helper that uses file locks so multiple processes can
   safely read and mutate shared records.
 - `examples/demo.py` &mdash; Minimal usage example.
+- `examples/scan_example.py` &mdash; Demonstrates scanning keys and persistent objects.
+- `examples/simple_counter.py` &mdash; Uses `PersistentObject` to track run counts.
 
 ### Prerequisites
 - Go 1.20 or newer (Go 1.25 used while developing the library).
@@ -103,6 +105,14 @@ python -m build
 ```
 
 The resulting wheel embeds the shared object located in `src/badgerdict/`.
+
+### Automated releases
+
+A GitHub Actions workflow (`.github/workflows/publish.yml`) builds the shared
+library, runs the test suite, and publishes wheels/sdists to PyPI whenever a
+release is published (or the workflow is triggered manually). Configure the
+repository secret `PYPI_API_TOKEN` with an API token generated from your PyPI
+account before running the workflow.
 
 ### Cleanup & caveats
 - Always call `close()` (or use the context manager) to release the underlying Badger handle; Badger flushes outstanding writes on close.

@@ -7,6 +7,7 @@ package main
 import "C"
 
 import (
+	"encoding/binary"
 	"errors"
 	"os"
 	"sync"
@@ -180,6 +181,85 @@ func Sync(handle C.uintptr_t) C.int {
 		return setError(err)
 	}
 	return setError(db.Sync())
+}
+
+//export Scan
+func Scan(handle C.uintptr_t, prefix *C.char, prefixLen C.int, resultLen *C.int) *C.char {
+	db, err := getHandle(uintptr(handle))
+	if err != nil {
+		setError(err)
+		return nil
+	}
+
+	var pref []byte
+	if prefixLen > 0 {
+		pref = C.GoBytes(unsafe.Pointer(prefix), prefixLen)
+	}
+
+	var buffer []byte
+	err = db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = true
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		if len(pref) > 0 {
+			for it.Seek(pref); it.ValidForPrefix(pref); it.Next() {
+				item := it.Item()
+				k := item.KeyCopy(nil)
+				if err := item.Value(func(val []byte) error {
+					buffer = appendEntry(buffer, k, val)
+					return nil
+				}); err != nil {
+					return err
+				}
+			}
+		} else {
+			for it.Rewind(); it.Valid(); it.Next() {
+				item := it.Item()
+				k := item.KeyCopy(nil)
+				if err := item.Value(func(val []byte) error {
+					buffer = appendEntry(buffer, k, val)
+					return nil
+				}); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		setError(err)
+		return nil
+	}
+
+	if len(buffer) == 0 {
+		*resultLen = 0
+		setError(nil)
+		return nil
+	}
+
+	mem := C.malloc(C.size_t(len(buffer)))
+	if mem == nil {
+		setError(errors.New("malloc failed"))
+		return nil
+	}
+
+	copy(((*[1 << 30]byte)(unsafe.Pointer(mem)))[:len(buffer):len(buffer)], buffer)
+	*resultLen = C.int(len(buffer))
+	setError(nil)
+	return (*C.char)(mem)
+}
+
+func appendEntry(buf []byte, key, value []byte) []byte {
+	var tmp [4]byte
+	binary.LittleEndian.PutUint32(tmp[:], uint32(len(key)))
+	buf = append(buf, tmp[:]...)
+	binary.LittleEndian.PutUint32(tmp[:], uint32(len(value)))
+	buf = append(buf, tmp[:]...)
+	buf = append(buf, key...)
+	buf = append(buf, value...)
+	return buf
 }
 
 //export LastError

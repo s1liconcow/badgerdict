@@ -1,11 +1,12 @@
 import ctypes
 import os
 import pickle
+import struct
 import tempfile
 import threading
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import Any, ClassVar, Optional, Union
+from typing import Any, Callable, ClassVar, List, Optional, Tuple, Union
 
 try:  # POSIX-only import guarded for portability.
     import fcntl  # type: ignore[attr-defined]
@@ -124,6 +125,9 @@ class BadgerDict:
 
         lib.Sync.argtypes = [ctypes.c_size_t]
         lib.Sync.restype = ctypes.c_int
+
+        lib.Scan.argtypes = [ctypes.c_size_t, ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+        lib.Scan.restype = ctypes.c_void_p
 
         lib.LastError.argtypes = []
         lib.LastError.restype = ctypes.c_void_p
@@ -302,6 +306,42 @@ class BadgerDict:
         status = self._call("Sync", ctypes.c_size_t(self._handle))
         self._check_status(status)
 
+    def scan(self, prefix: Any = None) -> List[Tuple[bytes, Any]]:
+        if prefix is None:
+            prefix_bytes = b""
+        else:
+            prefix_bytes = self._encode_key(prefix)
+
+        result_len = ctypes.c_int()
+        ptr = self._call(
+            "Scan",
+            ctypes.c_size_t(self._handle),
+            ctypes.c_char_p(prefix_bytes),
+            ctypes.c_int(len(prefix_bytes)),
+            ctypes.byref(result_len),
+        )
+
+        entries: List[Tuple[bytes, Any]] = []
+        try:
+            length = result_len.value
+            if not ptr or length == 0:
+                return entries
+
+            raw = ctypes.string_at(ptr, length)
+            offset = 0
+            while offset < length:
+                key_len, value_len = struct.unpack_from("<II", raw, offset)
+                offset += 8
+                key = raw[offset : offset + key_len]
+                offset += key_len
+                value_raw = raw[offset : offset + value_len]
+                offset += value_len
+                entries.append((bytes(key), self._decode_value(value_raw)))
+            return entries
+        finally:
+            if ptr:
+                self._lib.FreeBuffer(ptr)
+
     def close(self) -> None:
         if self._handle == 0:
             return
@@ -430,6 +470,24 @@ class PersistentObject:
         full_key = cls._format_key(key)
         with cls._locked_store() as store:
             return store.delete(full_key)
+
+    @classmethod
+    def scan(cls, predicate: Optional[Callable[[Any], bool]] = None) -> List["PersistentObject"]:
+        cls._ensure_configured()
+        namespace = cls._namespace or cls.__name__
+        results: List[PersistentObject] = []
+        with cls._locked_store() as store:
+            for raw_key, record in store.scan():
+                try:
+                    stored_ns, obj_key = pickle.loads(raw_key)
+                except Exception:
+                    continue
+                if stored_ns != namespace:
+                    continue
+                if predicate and not predicate(obj_key):
+                    continue
+                results.append(cls.from_record(obj_key, record))
+        return results
 
     @classmethod
     def update(
