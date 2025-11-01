@@ -1,8 +1,21 @@
 import ctypes
 import os
 import pickle
+import tempfile
 import threading
-from typing import Any, Optional, Union
+from contextlib import contextmanager, nullcontext
+from pathlib import Path
+from typing import Any, ClassVar, Optional, Union
+
+try:  # POSIX-only import guarded for portability.
+    import fcntl  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover - Windows fallback handled separately.
+    fcntl = None
+
+try:  # Windows-specific lock helpers.
+    import msvcrt  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover
+    msvcrt = None
 
 
 BytesLike = Union[bytes, bytearray, memoryview, str]
@@ -10,6 +23,51 @@ _MISSING = object()
 _VALUE_RAW = 0x00
 _VALUE_STR = 0x01
 _VALUE_PICKLED = 0x02
+
+
+class _FileLock:
+    """Minimal cross-platform advisory file lock for inter-process coordination."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._fh: Optional[Any] = None
+
+    def acquire(self) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o666)
+        self._fh = os.fdopen(fd, "r+b", buffering=0)
+        if fcntl is not None:
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
+        elif msvcrt is not None:  # pragma: no cover - Windows only
+            # Ensure there is at least one byte to lock on Windows.
+            if self._fh.tell() == 0:
+                self._fh.write(b"\0")
+                self._fh.flush()
+            msvcrt.locking(self._fh.fileno(), msvcrt.LK_LOCK, 1)
+        else:  # pragma: no cover - platforms without locking support
+            raise RuntimeError("file locking is not supported on this platform")
+
+    def release(self) -> None:
+        if not self._fh:
+            return
+        try:
+            if fcntl is not None:
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+            elif msvcrt is not None:  # pragma: no cover
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+        finally:
+            self._fh.close()
+            self._fh = None
+
+    def __enter__(self) -> "_FileLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.release()
+
+
+__all__ = ["BadgerDict", "BadgerError", "PersistentObject"]
 
 
 class BadgerError(Exception):
@@ -257,3 +315,231 @@ class BadgerDict:
             self.close()
         except Exception:
             pass
+
+
+class PersistentObject:
+    """Base class for Badger-backed persistent records with inter-process safety.
+
+    Subclasses should override :meth:`to_record` / :meth:`from_record` when the
+    default dictionary representation is insufficient. Storage is configured per
+    subclass via :meth:`configure_storage` and each operation acquires a file
+    lock so processes coordinate access safely.
+    """
+
+    _storage_path: ClassVar[Optional[Path]] = None
+    _storage_in_memory: ClassVar[bool] = False
+    _storage_lib_path: ClassVar[Optional[str]] = None
+    _storage_auto_pickle: ClassVar[bool] = True
+    _lock_path: ClassVar[Optional[Path]] = None
+    _namespace: ClassVar[Optional[str]] = None
+
+    def __init__(self, key: Any) -> None:
+        self.key = key
+
+    # ------------------------------------------------------------------
+    # Configuration helpers
+    # ------------------------------------------------------------------
+    @classmethod
+    def configure_storage(
+        cls,
+        path: Optional[str],
+        *,
+        in_memory: bool = False,
+        lib_path: Optional[str] = None,
+        auto_pickle: bool = True,
+        lock_path: Optional[str] = None,
+        namespace: Optional[str] = None,
+    ) -> None:
+        """Configure the Badger datastore backing this subclass.
+
+        Args:
+            path: Filesystem path for the Badger database. Required unless
+                ``in_memory`` is True.
+            in_memory: Whether to use an in-memory Badger instance.
+            lib_path: Optional override pointing at the compiled shared library.
+            auto_pickle: Whether values should be automatically pickled.
+            lock_path: Optional explicit path to a file used for inter-process
+                locking. Defaults to ``<path>.lock`` or a temp file for in-memory
+                stores.
+            namespace: Optional namespace prefix for keys. Defaults to the
+                class name.
+        """
+
+        if not in_memory:
+            if not path:
+                raise ValueError("path is required when using persistent storage")
+            resolved = Path(path).expanduser().resolve()
+            resolved.mkdir(parents=True, exist_ok=True)
+        else:
+            resolved = None
+
+        cls._storage_path = resolved
+        cls._storage_in_memory = in_memory
+        cls._storage_lib_path = lib_path
+        cls._storage_auto_pickle = auto_pickle
+        cls._namespace = namespace or cls.__name__
+
+        if lock_path:
+            cls._lock_path = Path(lock_path).expanduser().resolve()
+        elif in_memory:
+            temp_dir = Path(tempfile.gettempdir())
+            cls._lock_path = temp_dir / f"badgerdict-{cls.__name__}.lock"
+        elif resolved is not None:
+            cls._lock_path = resolved / f".{cls.__name__.lower()}.lock"
+        else:
+            cls._lock_path = None
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def save(self) -> "PersistentObject":
+        """Persist the current state."""
+
+        cls = type(self)
+
+        def _writer(_: "PersistentObject") -> "PersistentObject":
+            return self
+
+        cls.update(self.key, default_factory=lambda: self, mutator=_writer)
+        return self
+
+    @classmethod
+    def load(cls, key: Any, default: Any = _MISSING) -> "PersistentObject":
+        """Load an instance by key.
+
+        Args:
+            key: Identifier originally supplied to the constructor.
+            default: Optional fallback returned when the key is missing. If the
+                default is not provided a :class:`KeyError` is raised.
+        """
+
+        record = cls._get_record(key)
+        if record is _MISSING:
+            if default is _MISSING:
+                raise KeyError(key)
+            return default
+        return cls.from_record(key, record)
+
+    @classmethod
+    def exists(cls, key: Any) -> bool:
+        return cls._get_record(key) is not _MISSING
+
+    @classmethod
+    def delete(cls, key: Any) -> bool:
+        cls._ensure_configured()
+        full_key = cls._format_key(key)
+        with cls._locked_store() as store:
+            return store.delete(full_key)
+
+    @classmethod
+    def update(
+        cls,
+        key: Any,
+        *,
+        default_factory: Optional[Any] = None,
+        mutator: Optional[Any] = None,
+    ) -> "PersistentObject":
+        """Atomically load, mutate, and persist an object.
+
+        ``mutator`` receives the current object (creating one via
+        ``default_factory`` when missing). Returning ``None`` implies in-place
+        mutation and the same object is re-written.
+        """
+
+        cls._ensure_configured()
+        full_key = cls._format_key(key)
+
+        with cls._locked_store() as store:
+            record = store.get(full_key, default=_MISSING)
+            if record is _MISSING:
+                if default_factory is None:
+                    raise KeyError(key)
+                candidate = default_factory() if callable(default_factory) else default_factory
+                if not isinstance(candidate, cls):
+                    raise TypeError("default_factory must produce an instance of the subclass")
+                candidate.key = key
+                current = candidate
+            else:
+                current = cls.from_record(key, record)
+
+            if mutator is not None:
+                updated = mutator(current)
+                if updated is not None:
+                    current = updated
+
+            if not isinstance(current, cls):
+                raise TypeError("mutator must return an instance of the subclass or None")
+
+            store[full_key] = current.to_record()
+            return current
+
+    # ------------------------------------------------------------------
+    # Extensibility hooks
+    # ------------------------------------------------------------------
+    def to_record(self) -> Any:
+        """Convert the instance to a storable representation."""
+
+        payload = dict(self.__dict__)
+        payload.pop("key", None)
+        return payload
+
+    @classmethod
+    def from_record(cls, key: Any, record: Any) -> "PersistentObject":
+        instance = cls.__new__(cls)
+        cls.__init__(instance, key)
+        if isinstance(record, dict):
+            instance.__dict__.update(record)
+        else:
+            instance.value = record
+        return instance
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    @classmethod
+    def _ensure_configured(cls) -> None:
+        if cls._storage_path is None and not cls._storage_in_memory:
+            raise RuntimeError("PersistentObject storage is not configured")
+
+    @classmethod
+    def _format_key(cls, key: Any) -> bytes:
+        namespace = cls._namespace or cls.__name__
+        return pickle.dumps((namespace, key), protocol=pickle.HIGHEST_PROTOCOL)
+
+    @classmethod
+    @contextmanager
+    def _locked_store(cls):
+        cls._ensure_configured()
+        lock_cm = cls._lock_context()
+        with lock_cm:
+            with cls._open_store() as store:
+                yield store
+
+    @classmethod
+    def _lock_context(cls):
+        if cls._lock_path is None:
+            return nullcontext()
+        return _FileLock(cls._lock_path)
+
+    @classmethod
+    def _open_store(cls):
+        if cls._storage_in_memory:
+            path = None
+        elif cls._storage_path is not None:
+            path = str(cls._storage_path)
+        else:
+            path = None
+        return BadgerDict(
+            path,
+            in_memory=cls._storage_in_memory,
+            lib_path=cls._storage_lib_path,
+            auto_pickle=cls._storage_auto_pickle,
+        )
+
+    @classmethod
+    def _get_record(cls, key: Any) -> Any:
+        cls._ensure_configured()
+        full_key = cls._format_key(key)
+        with cls._locked_store() as store:
+            result = store.get(full_key, default=_MISSING)
+        return result

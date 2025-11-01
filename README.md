@@ -6,12 +6,26 @@ This project exposes a minimal dictionary-shaped interface to [BadgerDB](https:/
 - `badgerdict.go` &mdash; Go implementation of the shared library exports.
 - `src/badgerdict/__init__.py` &mdash; Python package exposing the `BadgerDict` class.
 - `src/badgerdict/libbadgerdict.*` &mdash; Platform-specific shared library produced by the Go compiler.
+- `PersistentObject` base class (in `src/badgerdict/__init__.py`) offers an
+  inheritable ORM-style helper that uses file locks so multiple processes can
+  safely read and mutate shared records.
 - `examples/demo.py` &mdash; Minimal usage example.
 
 ### Prerequisites
 - Go 1.20 or newer (Go 1.25 used while developing the library).
 - Python 3.9 or newer.
 - A C toolchain for building cgo shared objects (e.g. `build-essential` on Debian/Ubuntu, Xcode Command Line Tools on macOS, or MSYS2 on Windows).
+
+### Installation
+
+The package is published on PyPI; install it with:
+
+```bash
+pip install badgerdict
+```
+
+You will still need a platform-appropriate Go build of the shared library if
+you are building from source or developing locally (see below).
 
 ### Getting the Badger dependency
 
@@ -56,6 +70,10 @@ with BadgerDict("data") as store:
 By default the wrapper expects the shared library to be named `libbadgerdict.so`/`.dylib`/`.dll` in the same directory as the `badgerdict` package. If you relocate it, pass `lib_path="..."` when constructing `BadgerDict`.
 
 Values that are bytes-like or `str` are stored as-is; everything else is serialized with `pickle.dumps` by default. Disable that behaviour with `BadgerDict(..., auto_pickle=False)` if you need stricter type enforcement.
+
+For richer models, inherit from `PersistentObject` and call
+`YourModel.configure_storage(...)` once per process, then use `save()`,
+`load()`, and `update()` to modify state atomically across processes.
 
 To use an in-memory Badger store without touching disk, call `BadgerDict(None, in_memory=True)`.
 
