@@ -1,0 +1,14 @@
+
+# Build artifacts
+libbadgerdict.h
+libbadgerdict.so
+libbadgerdict.dylib
+libbadgerdict.dll
+
+# Badger data directories created by examples/tests
+data/
+
+# Python caches
+__pycache__/
+.pytest_cache/
+.gocache
