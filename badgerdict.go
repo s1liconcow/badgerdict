@@ -262,6 +262,64 @@ func appendEntry(buf []byte, key, value []byte) []byte {
 	return buf
 }
 
+//export Apply
+func Apply(handle C.uintptr_t, ops *C.char, opsLen C.int) C.int {
+	db, err := getHandle(uintptr(handle))
+	if err != nil {
+		return setError(err)
+	}
+
+	data := C.GoBytes(unsafe.Pointer(ops), opsLen)
+
+	err = db.Update(func(txn *badger.Txn) error {
+		offset := 0
+		for offset < len(data) {
+			op := data[offset]
+			offset++
+
+			if offset+4 > len(data) {
+				return errors.New("malformed operation key length")
+			}
+			keyLen := binary.LittleEndian.Uint32(data[offset : offset+4])
+			offset += 4
+			if offset+int(keyLen) > len(data) {
+				return errors.New("malformed operation key")
+			}
+			key := data[offset : offset+int(keyLen)]
+			offset += int(keyLen)
+
+			switch op {
+			case 0: // set
+				if offset+4 > len(data) {
+					return errors.New("malformed operation value length")
+				}
+				valLen := binary.LittleEndian.Uint32(data[offset : offset+4])
+				offset += 4
+				if offset+int(valLen) > len(data) {
+					return errors.New("malformed operation value")
+				}
+				val := data[offset : offset+int(valLen)]
+				offset += int(valLen)
+				if err := txn.Set(key, val); err != nil {
+					return err
+				}
+			case 1: // delete
+				if err := txn.Delete(key); err != nil {
+					if errors.Is(err, badger.ErrKeyNotFound) {
+						continue
+					}
+					return err
+				}
+			default:
+				return errors.New("unknown operation code")
+			}
+		}
+		return nil
+	})
+
+	return setError(err)
+}
+
 //export LastError
 func LastError() *C.char {
 	errorMu.Lock()

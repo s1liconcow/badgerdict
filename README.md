@@ -11,6 +11,7 @@ This project exposes a minimal dictionary-shaped interface to [BadgerDB](https:/
   safely read and mutate shared records.
 - `examples/demo.py` &mdash; Minimal usage example.
 - `examples/scan_example.py` &mdash; Demonstrates scanning keys and persistent objects.
+- `examples/indexed_profiles.py` &mdash; Pydantic-backed parent/child models with secondary indexes.
 - `examples/simple_counter.py` &mdash; Uses `PersistentObject` to track run counts.
 
 ### Prerequisites
@@ -76,6 +77,30 @@ Values that are bytes-like or `str` are stored as-is; everything else is seriali
 For richer models, inherit from `PersistentObject` and call
 `YourModel.configure_storage(...)` once per process, then use `save()`,
 `load()`, and `update()` to modify state atomically across processes.
+
+Alternatively, set private configuration attributes on your model. When no path
+is provided, a default of `./data/<model-name-lowercase>` is used. The helper
+`PersistentBaseModel` combines Pydantic with `PersistentObject`, automatically
+serializing models (and stdlib dataclasses) while keeping secondary indexes in
+sync:
+
+```python
+from badgerdict import PersistentBaseModel
+
+
+class User(PersistentBaseModel):
+    __persistent_key_field__ = "username"
+    __persistent_path__ = "data/users"
+    __persistent_secondary_indexes__ = {"email": lambda u: [u.email]}
+
+    username: str
+    email: str
+
+
+User(username="alice", email="alice@example.com").save()
+print(User.scan_index("email", "alice@example.com"))  # -> [User(...)]
+print(User.children("email", "alice@example.com"))     # same as scan_index
+```
 
 To use an in-memory Badger store without touching disk, call `BadgerDict(None, in_memory=True)`.
 

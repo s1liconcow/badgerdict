@@ -12,6 +12,13 @@ class Note(PersistentObject):
         self.text = text
         self.tags = []
 
+def note_tags(obj: Note):
+    return obj.tags
+
+
+def counter_value_index(obj: "Counter"):
+    return [obj.value]
+
 
 class Counter(PersistentObject):
     def __init__(self, key: str, value: int = 0) -> None:
@@ -34,14 +41,14 @@ class Counter(PersistentObject):
 
 
 def _counter_worker(db_path: str, lib_path: str, iterations: int) -> None:
-    Counter.configure_storage(db_path, lib_path=lib_path)
+    Counter.configure_storage(db_path, lib_path=lib_path, secondary_indexes={"value": counter_value_index})
     for _ in range(iterations):
         Counter.increment("global")
 
 
 def test_persistent_object_roundtrip(tmp_path, shared_library):
     db_path = tmp_path / "notes"
-    Note.configure_storage(str(db_path), lib_path=str(shared_library))
+    Note.configure_storage(str(db_path), lib_path=str(shared_library), secondary_indexes={"tag": note_tags})
 
     note = Note("n1", "hello world")
     note.tags = ["demo", "test"]
@@ -55,6 +62,13 @@ def test_persistent_object_roundtrip(tmp_path, shared_library):
     assert len(scans) == 1
     assert scans[0].text == "hello world"
 
+    tag_matches = Note.scan_index("tag", "demo")
+    assert len(tag_matches) == 1
+    assert tag_matches[0].text == "hello world"
+    via_children = Note.children("tag", "demo")
+    assert len(via_children) == 1
+    assert via_children[0].text == "hello world"
+
     assert Note.exists("n1")
     assert Note.delete("n1")
     with pytest.raises(KeyError):
@@ -63,7 +77,7 @@ def test_persistent_object_roundtrip(tmp_path, shared_library):
 
 def test_persistent_object_multi_process(tmp_path, shared_library):
     db_path = tmp_path / "counter"
-    Counter.configure_storage(str(db_path), lib_path=str(shared_library))
+    Counter.configure_storage(str(db_path), lib_path=str(shared_library), secondary_indexes={"value": counter_value_index})
 
     ctx = multiprocessing.get_context("spawn")
     procs = [
@@ -81,3 +95,9 @@ def test_persistent_object_multi_process(tmp_path, shared_library):
 
     multiples = Counter.scan(predicate=lambda k: isinstance(k, str))
     assert multiples and multiples[0].value == result.value
+
+    value_matches = Counter.scan_index("value", result.value)
+    assert len(value_matches) == 1
+    assert value_matches[0].value == result.value
+    child_matches = Counter.children("value", result.value)
+    assert child_matches and child_matches[0].value == result.value
