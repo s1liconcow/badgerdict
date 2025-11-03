@@ -13,7 +13,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -189,12 +188,13 @@ func (s *badgerStore) Apply(ops []operation) error {
 
 type slateStore struct {
 	db *slatedb.DB
+	writeOpts *slatedb.WriteOptions
 }
 
 func (s *slateStore) Close() error { return s.db.Close() }
 
 func (s *slateStore) Set(key, value []byte) error {
-	return s.db.Put(key, value)
+	return s.db.PutWithOptions(key, value, nil, s.writeOpts)
 }
 
 func (s *slateStore) Get(key []byte) ([]byte, error) {
@@ -206,7 +206,7 @@ func (s *slateStore) Get(key []byte) ([]byte, error) {
 }
 
 func (s *slateStore) Delete(key []byte) error {
-	return s.db.Delete(key)
+	return s.db.DeleteWithOptions(key, s.writeOpts)
 }
 
 func (s *slateStore) Iterate(prefix []byte, fn func(k, v []byte) error) error {
@@ -264,6 +264,7 @@ func (s *slateStore) Apply(ops []operation) error {
 type slateOpenConfig struct {
 	Path  string               `json:"path"`
 	Store *slatedb.StoreConfig `json:"store,omitempty"`
+	Async bool                 `json:"async,omitempty"`
 }
 
 func openStore(path string, inMemory bool) (kvStore, error) {
@@ -328,12 +329,16 @@ func openSlate(raw string) (kvStore, error) {
 	} else if storeCfg.Provider == "" {
 		storeCfg.Provider = slatedb.ProviderLocal
 	}
-
 	db, err := slatedb.Open(cfg.Path, storeCfg, nil)
 	if err != nil {
 		return nil, err
 	}
-	return &slateStore{db: db}, nil
+	return &slateStore{
+		db: db,
+		writeOpts: &slatedb.WriteOptions{
+			AwaitDurable: cfg.Async,
+			},
+		}, nil
 }
 
 func defaultDataDir(name string) string {

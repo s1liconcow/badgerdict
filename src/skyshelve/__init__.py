@@ -1,3 +1,4 @@
+import atexit
 import ctypes
 import importlib
 import dataclasses
@@ -86,6 +87,7 @@ __all__ = [
     "BadgerDict",
     "BadgerError",
     "slatedb_uri",
+    "slatedb_uri_from_env",
 ]
 
 
@@ -106,10 +108,13 @@ class SkyShelve:
         in_memory: bool = False,
         lib_path: Optional[str] = None,
         auto_pickle: bool = True,
+        default_factory: Optional[Callable[[], Any]] = None,
     ) -> None:
         self._ensure_library(lib_path)
         self._handle = self._open(path, in_memory)
         self._auto_pickle = auto_pickle
+        # Match collections.defaultdict by exposing the factory as a public attribute.
+        self.default_factory = default_factory
 
     @classmethod
     def _ensure_library(cls, lib_path: Optional[str]) -> None:
@@ -203,7 +208,10 @@ class SkyShelve:
         return int(handle)
 
     def __getitem__(self, key: Any) -> Any:
-        return self.get(key, raise_missing=True)
+        result = self.get(key, default=_MISSING)
+        if result is _MISSING:
+            return self._missing(key)
+        return result
 
     def __setitem__(self, key: Any, value: Any) -> None:
         self.set(key, value)
@@ -215,6 +223,14 @@ class SkyShelve:
     def __contains__(self, key: Any) -> bool:
         result = self.get(key, default=_MISSING)
         return result is not _MISSING
+
+    def _missing(self, key: Any) -> Any:
+        factory = getattr(self, "default_factory", None)
+        if factory is None:
+            raise KeyError(key)
+        value = factory()
+        self.set(key, value)
+        return value
 
     def __enter__(self) -> "SkyShelve":
         return self
@@ -409,7 +425,12 @@ BadgerDict = SkyShelve
 BadgerError = SkyshelveError
 
 
-def slatedb_uri(path: str, *, store: Optional[Dict[str, Any]] = None) -> str:
+def slatedb_uri(
+    path: str,
+    *,
+    store: Optional[Dict[str, Any]] = None,
+    options: Optional[Dict[str, Any]] = None,
+) -> str:
     """Utility to format a SlateDB configuration string for :class:`SkyShelve`.
 
     Args:
@@ -417,6 +438,8 @@ def slatedb_uri(path: str, *, store: Optional[Dict[str, Any]] = None) -> str:
         store: Optional store configuration dictionary mirroring
             :class:`slatedb.StoreConfig`. Use ``{"provider": "aws", "aws": {...}}``
             for AWS.
+        options: Optional dictionary mirroring ``slatedb.SlateDBOptions`` to fine-tune
+            flushing and caching behaviour.
 
     Returns:
         A ``slatedb:`` URI string suitable for ``SkyShelve`` or
@@ -426,7 +449,89 @@ def slatedb_uri(path: str, *, store: Optional[Dict[str, Any]] = None) -> str:
     payload: Dict[str, Any] = {"path": path}
     if store:
         payload["store"] = store
+    if options:
+        payload["options"] = options
     return f"slatedb:{json.dumps(payload)}"
+
+
+def slatedb_uri_from_env(
+    default_cache_path: Union[str, Path],
+    *,
+    env: Optional[Dict[str, str]] = None,
+    provider_env: str = "SKYSHELVE_PROVIDER",
+    cache_env: str = "SKYSHELVE_PATH",
+    async_env: str = "SKYSHELVE_ASYNC",
+    bucket_envs: Sequence[str] = ("BUCKET_NAME", "AWS_S3_BUCKET"),
+    region_envs: Sequence[str] = ("AWS_REGION", "AWS_DEFAULT_REGION"),
+    endpoint_env: str = "AWS_ENDPOINT_URL_S3",
+    access_key_env: str = "AWS_ACCESS_KEY_ID",
+    secret_key_env: str = "AWS_SECRET_ACCESS_KEY",
+) -> str:
+    """Derive a SlateDB URI from conventional SkyShelve environment variables.
+
+    Args:
+        default_cache_path: Local cache directory to fall back to when the
+            ``cache_env`` variable is not provided.
+        env: Optional environment mapping (defaults to :mod:`os.environ`).
+        provider_env: Environment variable used to force ``local`` or ``aws``.
+        cache_env: Environment variable pointing at the cache directory.
+        bucket_envs: Candidate variable names that can hold the S3 bucket.
+        region_envs: Candidate variable names that can hold the S3 region.
+        endpoint_env: Optional S3 endpoint override variable name.
+        access_key_env: Environment variable holding the AWS access key ID.
+        secret_key_env: Environment variable holding the AWS secret key.
+
+    Returns:
+        A ``slatedb:`` URI suitable for :class:`SkyShelve` or ``PersistentObject``.
+
+    Raises:
+        ValueError: When ``provider_env`` is set to an unsupported value or the
+            AWS configuration is incomplete.
+    """
+
+    env_map = os.environ if env is None else env
+
+    cache_path = str(env_map.get(cache_env, default_cache_path)).strip()
+    provider_override = env_map.get(provider_env)
+    if provider_override:
+        provider = provider_override.strip().lower()
+    else:
+        has_creds = bool(env_map.get(access_key_env) and env_map.get(secret_key_env))
+        bucket_env = ""
+        for name in bucket_envs:
+            value = env_map.get(name)
+            if value:
+                bucket_env = value.strip()
+                break
+        provider = "aws" if has_creds and bucket_env else "local"
+
+    if provider not in {"local", "aws"}:
+        raise ValueError(f"Unsupported provider '{provider}' (expected 'local' or 'aws')")
+
+    if provider == "aws":
+        bucket = ""
+        for name in bucket_envs:
+            value = env_map.get(name)
+            if value and not bucket:
+                bucket = value.strip()
+        region = ""
+        for name in region_envs:
+            value = env_map.get(name)
+            if value and not region:
+                region = value.strip()
+        if not bucket or not region:
+            raise ValueError("AWS provider requires BUCKET_NAME (or AWS_S3_BUCKET) and AWS_REGION (or AWS_DEFAULT_REGION)")
+        aws_cfg: Dict[str, Any] = {"bucket": bucket, "region": region}
+        endpoint = env_map.get(endpoint_env, "").strip()
+        if endpoint:
+            aws_cfg["endpoint"] = endpoint
+        store_cfg: Dict[str, Any] = {"provider": "aws", "aws": aws_cfg}
+    else:
+        store_cfg = {"provider": "local"}
+    
+    store_cfg['async'] = bool(env_map.get('SKYSHELVE_ASYNC', "false").lower())
+
+    return slatedb_uri(cache_path, store=store_cfg)
 
 
 def _extract_slatedb_cache_root(uri: str) -> Optional[str]:
@@ -468,6 +573,10 @@ class PersistentObject:
     _namespace: ClassVar[Optional[str]] = None
     _secondary_indexes: ClassVar[Dict[str, Callable[["PersistentObject"], Iterable[Any]]]] = {}
     _auto_configured: ClassVar[bool] = False
+    _store_tls: ClassVar[Optional[threading.local]] = None
+    _store_cache_lock: ClassVar[Optional[threading.Lock]] = None
+    _cached_stores: ClassVar[List["SkyShelve"]] = []
+    _cleanup_registered: ClassVar[bool] = False
 
     def __init__(self, key: Any) -> None:
         self._set_persistent_key(key)
@@ -542,6 +651,8 @@ class PersistentObject:
         """
 
         cache_root: Optional[Path] = None
+
+        cls._reset_store_cache()
 
         if not in_memory:
             if not path:
@@ -836,8 +947,116 @@ class PersistentObject:
         cls._ensure_configured()
         lock_cm = cls._lock_context()
         with lock_cm:
-            with cls._open_store() as store:
-                yield store
+            store = cls._get_store()
+            yield store
+
+    @classmethod
+    @contextmanager
+    def using_store(cls, store: "SkyShelve"):
+        """Temporarily bind an existing SkyShelve handle to this thread.
+
+        This lets callers share a store they've already opened, avoiding the
+        cost of re-opening SlateDB during nested PersistentObject operations.
+        """
+
+        cls._ensure_configured()
+        tls = getattr(cls, "_store_tls", None)
+        if tls is None:
+            tls = threading.local()
+            cls._store_tls = tls
+        previous = getattr(tls, "store", None)
+        setattr(tls, "store", store)
+        try:
+            yield
+        finally:
+            if previous is not None:
+                setattr(tls, "store", previous)
+            else:
+                try:
+                    delattr(tls, "store")
+                except AttributeError:
+                    pass
+
+    @classmethod
+    def attach_store(cls, store: "SkyShelve") -> None:
+        """Bind an existing SkyShelve handle to the current thread without a context."""
+
+        cls._ensure_configured()
+        tls = getattr(cls, "_store_tls", None)
+        if tls is None:
+            tls = threading.local()
+            cls._store_tls = tls
+        setattr(tls, "store", store)
+        cls._register_cached_store(store)
+
+    @classmethod
+    def _get_store(cls) -> "SkyShelve":
+        tls = getattr(cls, "_store_tls", None)
+        if tls is None:
+            tls = threading.local()
+            cls._store_tls = tls
+        store = getattr(tls, "store", None)
+        if store is None or getattr(store, "_handle", 0) == 0:
+            store = cls._open_store()
+            setattr(tls, "store", store)
+            cls._register_cached_store(store)
+        return store
+
+    @classmethod
+    def _register_cached_store(cls, store: "SkyShelve") -> None:
+        lock = getattr(cls, "_store_cache_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            cls._store_cache_lock = lock
+        cache = getattr(cls, "_cached_stores", None)
+        if cache is None:
+            cache = []
+            cls._cached_stores = cache
+        with lock:
+            cache.append(store)
+        cls._ensure_cleanup_registered()
+
+    @classmethod
+    def _ensure_cleanup_registered(cls) -> None:
+        if getattr(cls, "_cleanup_registered", False):
+            return
+
+        def _cleanup() -> None:
+            cls._close_cached_stores()
+
+        atexit.register(_cleanup)
+        cls._cleanup_registered = True
+
+    @classmethod
+    def _close_cached_stores(cls) -> None:
+        lock = getattr(cls, "_store_cache_lock", None)
+        if lock is None:
+            return
+        stores: List["SkyShelve"] = []
+        with lock:
+            cache = getattr(cls, "_cached_stores", None)
+            if cache:
+                stores = list(cache)
+            cls._cached_stores = []
+        for store in stores:
+            try:
+                store.close()
+            except Exception:
+                pass
+        tls = getattr(cls, "_store_tls", None)
+        if tls is not None:
+            try:
+                delattr(tls, "store")
+            except AttributeError:
+                pass
+
+    @classmethod
+    def _reset_store_cache(cls) -> None:
+        cls._close_cached_stores()
+        cls._store_tls = threading.local()
+        cls._store_cache_lock = threading.Lock()
+        cls._cached_stores = []
+        cls._cleanup_registered = False
 
     @classmethod
     def _lock_context(cls):

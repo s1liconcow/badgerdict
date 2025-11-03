@@ -90,6 +90,16 @@ that previously depended on the old package name.
 
 Values that are bytes-like or `str` are stored as-is; everything else is serialized with `pickle.dumps` by default. Disable that behaviour with `SkyShelve(..., auto_pickle=False)` if you need stricter type enforcement.
 
+Provide `default_factory=` (similar to `collections.defaultdict`) to automatically create and persist values for missing keys:
+
+```python
+from collections import deque
+
+with SkyShelve("data", default_factory=deque) as store:
+    store["jobs"].append("build")  # deque() is created on first access
+    store.sync()
+```
+
 For richer models, inherit from `PersistentObject` and call
 `YourModel.configure_storage(...)` once per process, then use `save()`,
 `load()`, and `update()` to modify state atomically across processes.
