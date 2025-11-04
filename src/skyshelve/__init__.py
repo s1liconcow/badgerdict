@@ -10,7 +10,7 @@ import tempfile
 import threading
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import Any, Callable, ClassVar, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, ClassVar, Dict, Iterable, List, Optional, Sequence, Tuple, Union, cast
 
 try:  # POSIX-only import guarded for portability.
     import fcntl  # type: ignore[attr-defined]
@@ -428,13 +428,15 @@ BadgerError = SkyshelveError
 def slatedb_uri(
     path: str,
     *,
+    cache_dir: Optional[str] = None,
     store: Optional[Dict[str, Any]] = None,
     options: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Utility to format a SlateDB configuration string for :class:`SkyShelve`.
 
     Args:
-        path: Local cache directory passed to SlateDB.
+        path: Path used by SlateDB for on-disk storage or remote prefixes (e.g. S3).
+        cache_dir: Optional local cache directory for object-store backed deployments.
         store: Optional store configuration dictionary mirroring
             :class:`slatedb.StoreConfig`. Use ``{"provider": "aws", "aws": {...}}``
             for AWS.
@@ -447,6 +449,8 @@ def slatedb_uri(
     """
 
     payload: Dict[str, Any] = {"path": path}
+    if cache_dir:
+        payload["cache_dir"] = cache_dir
     if store:
         payload["store"] = store
     if options:
@@ -459,7 +463,7 @@ def slatedb_uri_from_env(
     *,
     env: Optional[Dict[str, str]] = None,
     provider_env: str = "SKYSHELVE_PROVIDER",
-    cache_env: str = "SKYSHELVE_PATH",
+    cache_env: str = "SKYSHELVE_CACHE_PATH",
     async_env: str = "SKYSHELVE_ASYNC",
     bucket_envs: Sequence[str] = ("BUCKET_NAME", "AWS_S3_BUCKET"),
     region_envs: Sequence[str] = ("AWS_REGION", "AWS_DEFAULT_REGION"),
@@ -474,7 +478,7 @@ def slatedb_uri_from_env(
             ``cache_env`` variable is not provided.
         env: Optional environment mapping (defaults to :mod:`os.environ`).
         provider_env: Environment variable used to force ``local`` or ``aws``.
-        cache_env: Environment variable pointing at the cache directory.
+        cache_env: Environment variable pointing at the local cache directory.
         bucket_envs: Candidate variable names that can hold the S3 bucket.
         region_envs: Candidate variable names that can hold the S3 region.
         endpoint_env: Optional S3 endpoint override variable name.
@@ -491,7 +495,9 @@ def slatedb_uri_from_env(
 
     env_map = os.environ if env is None else env
 
-    cache_path = str(env_map.get(cache_env, default_cache_path)).strip()
+    raw_cache = env_map.get(cache_env)
+    cache_dir = raw_cache.strip() if raw_cache else str(default_cache_path)
+
     provider_override = env_map.get(provider_env)
     if provider_override:
         provider = provider_override.strip().lower()
@@ -528,10 +534,17 @@ def slatedb_uri_from_env(
         store_cfg: Dict[str, Any] = {"provider": "aws", "aws": aws_cfg}
     else:
         store_cfg = {"provider": "local"}
-    
-    store_cfg['async'] = bool(env_map.get('SKYSHELVE_ASYNC', "false").lower())
 
-    return slatedb_uri(cache_path, store=store_cfg)
+    async_raw = env_map.get(async_env, "")
+    async_flag = async_raw.strip().lower() in {"1", "true", "yes", "on"}
+    store_cfg["async"] = async_flag
+
+    if provider == "aws":
+        path_value = "/"
+        return slatedb_uri(path_value, cache_dir=cache_dir, store=store_cfg)
+
+    path_value = cache_dir
+    return slatedb_uri(path_value, store=store_cfg)
 
 
 def _extract_slatedb_cache_root(uri: str) -> Optional[str]:
@@ -1144,8 +1157,10 @@ if _PydanticBaseModel is not None:
 
         __persistent_key_field__ = "id"
         _persistent_key: Any = _PydanticPrivateAttr(None)  # type: ignore[misc]
+        _persistent_store: Any = _PydanticPrivateAttr(None)  # type: ignore[misc]
 
         def __init__(self, **data):
+            store = data.pop("store", None)
             key_field = self.__persistent_key_field__
             if key_field not in data:
                 raise ValueError(f"Missing primary key field '{key_field}'")
@@ -1153,6 +1168,9 @@ if _PydanticBaseModel is not None:
             PersistentObject.__init__(self, key_value)
             _PydanticBaseModel.__init__(self, **data)
             self._persistent_key = key_value
+            if store is not None:
+                type(self).attach_store(store)
+            self._persistent_store = store
 
         def _set_persistent_key(self, key: Any) -> None:  # type: ignore[override]
             self._persistent_key = key
@@ -1172,6 +1190,31 @@ if _PydanticBaseModel is not None:
         @key.setter
         def key(self, value: Any) -> None:  # type: ignore[override]
             self._set_persistent_key(value)
+
+        @classmethod
+        def from_record(cls, key: Any, record: Any) -> "PersistentBaseModel":
+            instance = cast("PersistentBaseModel", super().from_record(key, record))
+            tls = getattr(cls, "_store_tls", None)
+            store = getattr(tls, "store", None) if tls is not None else None
+            try:
+                instance._persistent_store = store
+            except Exception:
+                pass
+            return instance
+
+        def bind_store(self, store: "SkyShelve") -> None:
+            type(self).attach_store(store)
+            self._persistent_store = store
+
+        def _with_store(self):
+            store = getattr(self, "_persistent_store", None)
+            if store is None:
+                return nullcontext()
+            return type(self).using_store(store)
+
+        def save(self) -> "PersistentObject":  # type: ignore[override]
+            with self._with_store():
+                return super().save()
 
 
     __all__.append("PersistentBaseModel")

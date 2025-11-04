@@ -2,24 +2,29 @@
 
 from __future__ import annotations
 
+import atexit
 import sys
 from pathlib import Path
 from typing import List
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import Field, field_validator
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from skyshelve import PersistentBaseModel
+DB_PATH = str(PROJECT_ROOT / "data" / "db")
+from skyshelve import PersistentBaseModel, SkyShelve
+
+STORE = SkyShelve(DB_PATH)
+atexit.register(STORE.close)
 
 
 class ToDo(PersistentBaseModel):
     __persistent_key_field__ = "id"
-    __persistent_path__ = str(PROJECT_ROOT / "data" / "profiles" / "todos")
+    __persistent_store__ = STORE
     __persistent_secondary_indexes__ = {"user": lambda todo: [todo.user_id]}
 
     id: str
@@ -34,7 +39,7 @@ class ToDo(PersistentBaseModel):
 
 class UserProfile(PersistentBaseModel):
     __persistent_key_field__ = "username"
-    __persistent_path__ = str(PROJECT_ROOT / "data" / "profiles" / "users")
+    __persistent_store__ = STORE
     __persistent_secondary_indexes__ = {
         "email": lambda profile: [profile.email],
         "tag": lambda profile: profile.tags,
@@ -51,6 +56,7 @@ class UserProfile(PersistentBaseModel):
 
     def todos(self) -> List[ToDo]:
         return ToDo.children("user", self.username)
+
 
 
 def seed_data() -> None:

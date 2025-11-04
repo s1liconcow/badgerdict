@@ -25,16 +25,16 @@ import sys
 from contextlib import contextmanager
 from pathlib import Path
 from time import perf_counter
+import time
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-DEFAULT_PATH = PROJECT_ROOT / "data" / "slatedb-demo"
+DEFAULT_CACHE_PATH = PROJECT_ROOT / "data" / "slatedb-demo"
 
 from skyshelve import (
-    PersistentObject,
     SkyShelve,
     SkyshelveError,
     slatedb_uri_from_env,
@@ -53,7 +53,7 @@ def _timed(label: str) -> None:
 
 
 try:
-    SLATE_URI = slatedb_uri_from_env(DEFAULT_PATH)
+    SLATE_URI = slatedb_uri_from_env(DEFAULT_CACHE_PATH)
 except ValueError as exc:
     raise SystemExit(str(exc)) from exc
 print(f"Using SlateDB at {SLATE_URI}")
@@ -78,9 +78,10 @@ def main() -> None:
         STORE["logins_alice"] += 1
         STORE.sync()
     
-    for username, logins in STORE.scan("logins_"):
-        print(f"{username}: {logins}")
-
+    with _timed("Record scan"):
+        for username, logins in STORE.scan("logins_"):
+            print(f"{username}: {logins}")
+    
 if __name__ == "__main__":
     try:
         main()

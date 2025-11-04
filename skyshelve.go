@@ -288,6 +288,7 @@ func openBadger(path string, inMemory bool) (kvStore, error) {
 			return nil, err
 		}
 		opts = badger.DefaultOptions(path)
+		opts.Logger = nil
 	}
 
 	db, err := badger.Open(opts)

@@ -1,12 +1,7 @@
 ## Skyshelve: Backend-Agnostic Persistent Python Mapping
 
-Skyshelve exposes a minimal dictionary-shaped interface to embedded key-value
-stores such as [BadgerDB](https://github.com/dgraph-io/badger) and
-[SlateDB](https://slatedb.io/). The core is a Go library compiled in
-`c-shared` mode which provides a handful of exported functions that manage the
-selected backend and offer CRUD primitives. A small `ctypes` shim
-(`src/skyshelve/__init__.py`) loads the shared object and presents a
-Python-friendly API.
+Skyshelve exposes a dictionary-shaped interface to key-value stores such as [BadgerDB](https://github.com/dgraph-io/badger) and [SlateDB](https://slatedb.io/). The core is a Go library compiled in `c-shared` mode which provides a handful of exported functions that manage the selected backend and offer CRUD primitives. A `ctypes` shim
+(`src/skyshelve/__init__.py`) loads the shared object and presents a Python-friendly API.
 
 ### Layout
 - `skyshelve.go` &mdash; Go implementation of the shared library exports.
@@ -158,7 +153,8 @@ import json
 from skyshelve import SkyShelve
 
 config = {
-    "path": "/tmp/slatedb-cache",
+    "path": "production/prefix",
+    "cache_dir": "/tmp/slatedb-cache",
     "store": {
         "provider": "aws",
         "aws": {
